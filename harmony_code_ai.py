@@ -189,10 +189,7 @@ class ArkTSParser:
                 classes = self._parse_file(content, rel_path)
                 for cls in classes:
                     all_classes.append(cls)
-                    # 提取调用关系
-                    calls = self._extract_calls(cls, all_classes)
-                    all_calls.extend(calls)
-                    # 提取组件嵌套
+                    # 提取组件嵌套（不依赖其他类）
                     if cls.is_component:
                         comps = self._extract_components(cls)
                         all_components.extend(comps)
@@ -204,6 +201,11 @@ class ArkTSParser:
             except Exception as e:
                 self.errors.append(f"解析 {file_path} 失败: {e}")
                 logger.debug(f"解析 {file_path} 失败: {e}")
+
+        # 第二遍：提取调用关系（此时所有类都已解析完成）
+        for cls in all_classes:
+            calls = self._extract_calls(cls, all_classes)
+            all_calls.extend(calls)
 
         logger.info(f"解析完成: {self.files_parsed} 文件, {len(all_classes)} 个类, "
                     f"{len(all_calls)} 个调用关系, {len(all_components)} 个组件关系")
@@ -243,6 +245,8 @@ class ArkTSParser:
 
     def _is_in_backtick_string(self, content: str, pos: int) -> bool:
         """检查给定位置是否在反引号模板字符串内"""
+        if pos < 0 or pos >= len(content):
+            return False
         count = 0
         i = 0
         while i < pos and i < len(content):
@@ -256,6 +260,8 @@ class ArkTSParser:
 
     def _is_in_string(self, content: str, pos: int) -> bool:
         """检查给定位置是否在任何字符串内（单引号、双引号、反引号）"""
+        if pos < 0 or pos >= len(content):
+            return False
         i = 0
         in_single = False
         in_double = False
@@ -289,7 +295,10 @@ class ArkTSParser:
         # 查找所有 struct/class/interface/enum 定义
         # 支持 @decorator 前缀、export、default、abstract
         pattern = re.compile(
-            r'^(\s*)(export\s+)?(default\s+)?(abstract\s+)?(struct|class|interface|enum)\s+(\w+)'
+            r'^(\s*)'  # 行首空白
+            r'((?:@\w+\s*)*)'  # 可选的装饰器（如 @Component, @Entry 等）
+            r'(export\s+)?(default\s+)?(abstract\s+)?'
+            r'(struct|class|interface|enum)\s+(\w+)'
             r'(\s*<[^>]*>)?'  # 可选泛型参数 <T> 或 <K, V>
             r'(?:\s+extends\s+(\w+))?'
             r'(?:\s+implements\s+([\w,\s]+))?',
@@ -301,16 +310,19 @@ class ArkTSParser:
             if self._is_in_string(content, match.start()):
                 continue
 
-            kind = match.group(5)
-            name = match.group(6)
-            generic_part = (match.group(7) or "").strip()  # 泛型参数部分，如 <T> 或 <K, V>
-            extends = match.group(8) or ""
-            implements_str = match.group(9) or ""
+            kind = match.group(6)
+            name = match.group(7)
+            generic_part = (match.group(8) or "").strip()  # 泛型参数部分，如 <T> 或 <K, V>
+            extends = match.group(9) or ""
+            implements_str = match.group(10) or ""
             implements = [i.strip() for i in implements_str.split(',') if i.strip()]
 
-            # 提取装饰器（向上查找）
+            # 提取装饰器（从正则匹配的装饰器部分 + 向上查找）
             start_pos = match.start()
-            decorators = self._extract_decorators(content[:start_pos])
+            decorators_str = match.group(2) or ""
+            decorators = self._extract_decorators_from_text(decorators_str)
+            # 同时向上查找（处理多行装饰器）
+            decorators.extend(self._extract_decorators(content[:start_pos]))
 
             # 计算行号
             line_start = content[:start_pos].count('\n') + 1
@@ -372,6 +384,18 @@ class ArkTSParser:
                 # 如果是普通代码行，停止
                 break
 
+        return decorators
+
+    def _extract_decorators_from_text(self, text: str) -> List[ArkDecorator]:
+        """从文本中提取装饰器（如 @Component @Entry）"""
+        decorators = []
+        # 匹配 @DecoratorName 或 @DecoratorName(params)
+        pattern = re.compile(r'@(\w+)(?:\(([^)]*)\))?')
+        for m in pattern.finditer(text):
+            decorators.append(ArkDecorator(
+                name=m.group(1),
+                params=m.group(2) or ""
+            ))
         return decorators
 
     def _find_block_end(self, content: str, start: int) -> int:
@@ -445,9 +469,9 @@ class ArkTSParser:
 
         # 匹配方法定义（支持 async, public, private, protected, static, override 等修饰符）
         # 同时支持 @Builder 装饰的方法（如 @Builder MyHeader() { ... }）
-        # 使用 (?:^|\n|\{|\;) 匹配行首、换行后、花括号后或分号后
+        # 使用 (?:^|\n|\}|\;) 匹配行首、换行后、花括号后或分号后
         pattern = re.compile(
-            r'(?:^|\n|\{|\;)'  # 行首、换行后、花括号后或分号后
+            r'(?:^|\n|\}|\;)'  # 行首、换行后、花括号后或分号后
             r'(\s*)'  # 缩进
             r'(?:(?:@Builder\s+)?)?'  # 可选的 @Builder 装饰器
             r'((?:(?:async|public|private|protected|static|override|readonly|abstract)\s+)*)'  # 修饰符
@@ -461,7 +485,7 @@ class ArkTSParser:
         # 第二个正则：匹配带装饰器的方法（如 @Watch('onChange') onChange() { ... }）
         # 装饰器和方法名在同一行，中间可能有参数
         decorator_method_pattern = re.compile(
-            r'(?:^|\n|\{|\;)'  # 行首、换行后、花括号后或分号后
+            r'(?:^|\n|\}|\;)'  # 行首、换行后、花括号后或分号后
             r'(\s*)'  # 缩进
             r'@(\w+)\s*'  # 装饰器名 @XXX
             r'(?:\([^)]*\))?\s*'  # 可选的装饰器参数 (...)
@@ -604,7 +628,7 @@ class ArkTSParser:
         methods = []
 
         pattern = re.compile(
-            r'(?:^|\n|\{|\;)'
+            r'(?:^|\n|\}|\{|\;)'  # 添加 \{ 以匹配花括号后的方法
             r'\s*'
             r'((?:(?:async|public|private|protected|static|override|readonly|abstract)\s+)*)'
             r'(\w+)'
@@ -742,6 +766,9 @@ class ArkTSParser:
             # 跳过字符串内的匹配
             if self._is_in_string(body, m.start()):
                 continue
+            # 跳过注释内的匹配
+            if self._is_in_comment(body, m.start()):
+                continue
             fields.append(m.group(1))
 
         # 匹配普通字段: fieldName: Type = value 或 fieldName: Type
@@ -753,6 +780,9 @@ class ArkTSParser:
         for m in pattern2.finditer(body):
             # 跳过字符串内的匹配
             if self._is_in_string(body, m.start()):
+                continue
+            # 跳过注释内的匹配
+            if self._is_in_comment(body, m.start()):
                 continue
             name = m.group(1)
             if name not in fields and name not in ('if', 'for', 'while', 'return', 'const', 'let', 'var',
@@ -868,6 +898,10 @@ class ArkTSParser:
 
                 # 跳过字符串中的内容（使用精确的位置检查）
                 if self._is_in_string(method.body, paren_pos):
+                    return
+
+                # 跳过注释中的内容
+                if self._is_in_comment(method.body, paren_pos):
                     return
 
                 # 跳过链式调用中的UI属性
@@ -1012,6 +1046,49 @@ class ArkTSParser:
 
         return calls
 
+    def _is_in_comment(self, content: str, pos: int) -> bool:
+        """检查给定位置是否在注释中（单行注释 // 或多行注释 /* */）"""
+        if pos < 0 or pos >= len(content):
+            return False
+        i = 0
+        in_block_comment = False
+        while i < pos:
+            if in_block_comment:
+                if content[i:i+2] == '*/':
+                    in_block_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if content[i:i+2] == '/*':
+                in_block_comment = True
+                i += 2
+                continue
+            if content[i:i+2] == '//':
+                # 单行注释，检查pos是否在同一行
+                line_end = content.find('\n', i)
+                if line_end == -1:
+                    line_end = len(content)
+                if pos < line_end:
+                    return True
+                i = line_end + 1
+                continue
+            # 跳过字符串（字符串中的 // 或 /* 不是注释）
+            if content[i] in ('"', "'", '`'):
+                quote_char = content[i]
+                i += 1
+                while i < len(content):
+                    if content[i] == '\\':
+                        i += 2
+                        continue
+                    if content[i] == quote_char:
+                        i += 1
+                        break
+                    i += 1
+                continue
+            i += 1
+        return in_block_comment
+
     def _extract_components(self, cls: ArkClass) -> List[ArkComponent]:
         """从 @Component 类的 build() 和 @Builder 方法中提取组件嵌套关系"""
         components = []
@@ -1036,6 +1113,12 @@ class ArkTSParser:
         seen = set()
         for method in target_methods:
             for m in component_pattern.finditer(method.body):
+                # 跳过注释中的匹配
+                if self._is_in_comment(method.body, m.start()):
+                    continue
+                # 跳过字符串中的匹配
+                if self._is_in_string(method.body, m.start()):
+                    continue
                 comp_name = m.group(1)
                 # 检查是否是已知组件（内置或自定义）
                 if comp_name in self.BUILTIN_COMPONENTS or comp_name[0].isupper():
@@ -1230,11 +1313,15 @@ class CodeDatabase:
 
     def query(self, sql: str) -> List[Dict]:
         """执行查询并返回字典列表"""
-        cursor = self.conn.execute(sql)
-        if cursor.description:
-            columns = [d[0] for d in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-        return []
+        try:
+            cursor = self.conn.execute(sql)
+            if cursor.description:
+                columns = [d[0] for d in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            return []
+        except Exception as e:
+            # 查询失败返回空列表（如表不存在）
+            return []
 
     def get_stats(self) -> Dict:
         """获取数据库统计信息"""
