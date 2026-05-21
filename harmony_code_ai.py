@@ -26,6 +26,7 @@ import sys
 import sqlite3
 import argparse
 import logging
+import threading
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
 from dataclasses import dataclass, field
@@ -469,9 +470,10 @@ class ArkTSParser:
 
         # 匹配方法定义（支持 async, public, private, protected, static, override 等修饰符）
         # 同时支持 @Builder 装饰的方法（如 @Builder MyHeader() { ... }）
-        # 使用 (?:^|\n|\}|\;) 匹配行首、换行后、花括号后或分号后
+        # 使用 (?:^|\n|\}|\{|\;) 匹配行首、换行后、花括号后或分号后
+        # 添加 \{ 以匹配类体开头的方法（如 "{ method() {}"）
         pattern = re.compile(
-            r'(?:^|\n|\}|\;)'  # 行首、换行后、花括号后或分号后
+            r'(?:^|\n|\}|\{|\;)'  # 行首、换行后、花括号后、左花括号后或分号后
             r'(\s*)'  # 缩进
             r'(?:(?:@Builder\s+)?)?'  # 可选的 @Builder 装饰器
             r'((?:(?:async|public|private|protected|static|override|readonly|abstract)\s+)*)'  # 修饰符
@@ -485,7 +487,7 @@ class ArkTSParser:
         # 第二个正则：匹配带装饰器的方法（如 @Watch('onChange') onChange() { ... }）
         # 装饰器和方法名在同一行，中间可能有参数
         decorator_method_pattern = re.compile(
-            r'(?:^|\n|\}|\;)'  # 行首、换行后、花括号后或分号后
+            r'(?:^|\n|\}|\{|\;)'  # 行首、换行后、花括号后、左花括号后或分号后
             r'(\s*)'  # 缩进
             r'@(\w+)\s*'  # 装饰器名 @XXX
             r'(?:\([^)]*\))?\s*'  # 可选的装饰器参数 (...)
@@ -1138,21 +1140,34 @@ class ArkTSParser:
 class CodeDatabase:
     """代码数据库管理器"""
 
+    # 类级别的锁，用于序列化所有数据库操作
+    _lock = threading.Lock()
+
     def __init__(self, db_path: str = "code.db"):
         self.db_path = os.path.abspath(db_path)
         self.conn: Optional[sqlite3.Connection] = None
 
     def __enter__(self):
-        self.conn = sqlite3.connect(self.db_path, timeout=30)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self._create_tables()
-        return self
+        # 获取锁确保线程安全
+        self._lock.acquire()
+        try:
+            self.conn = sqlite3.connect(self.db_path, timeout=60)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self._create_tables()
+            return self
+        except:
+            self._lock.release()
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+        try:
+            if self.conn:
+                self.conn.close()
+                self.conn = None
+        finally:
+            self._lock.release()
 
     def _create_tables(self):
         """创建表（如果不存在）"""
@@ -1240,6 +1255,7 @@ class CodeDatabase:
 
     def clear_project_data(self):
         """清除项目数据（保留表结构）"""
+        # 锁已在 __enter__ 中获取
         self.conn.executescript("""
         DELETE FROM files;
         DELETE FROM classes;
@@ -1254,7 +1270,7 @@ class CodeDatabase:
     def insert_data(self, classes: List[ArkClass], calls: List[ArkCall],
                     components: List[ArkComponent], files: List[str],
                     imports: List[ArkImport]):
-        """批量插入解析数据"""
+        """批量插入解析数据（线程安全，锁已在__enter__中获取）"""
         # 插入文件
         self.conn.executemany(
             "INSERT OR IGNORE INTO files(path) VALUES (?)",
